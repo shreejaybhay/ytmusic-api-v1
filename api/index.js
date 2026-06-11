@@ -3,32 +3,32 @@ const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-let ytPromise, ytWebPromise, Platform;
+let ytPromise, ytWebPromise, ytMwebPromise, Platform;
+
+async function createYT(ct) {
+  const mod = await import('youtubei.js');
+  Platform = mod.Platform;
+  Platform.shim.eval = async (data) => new Function(data.output)();
+  return mod.Innertube.create({
+    cache: new mod.UniversalCache(false),
+    client_type: ct,
+    generate_session_locally: true,
+  });
+}
 
 async function getYT() {
-  if (!ytPromise) {
-    const mod = await import('youtubei.js');
-    Platform = mod.Platform;
-    Platform.shim.eval = async (data) => new Function(data.output)();
-    ytPromise = mod.Innertube.create({
-      cache: new mod.UniversalCache(false),
-      client_type: mod.ClientType.ANDROID,
-    });
-  }
+  if (!ytPromise) ytPromise = createYT((await import('youtubei.js')).ClientType.ANDROID);
   return ytPromise;
 }
 
 async function getYTWeb() {
-  if (!ytWebPromise) {
-    const mod = await import('youtubei.js');
-    Platform = mod.Platform;
-    Platform.shim.eval = async (data) => new Function(data.output)();
-    ytWebPromise = mod.Innertube.create({
-      cache: new mod.UniversalCache(false),
-      client_type: 'WEB',
-    });
-  }
+  if (!ytWebPromise) ytWebPromise = createYT('WEB');
   return ytWebPromise;
+}
+
+async function getYTMweb() {
+  if (!ytMwebPromise) ytMwebPromise = createYT((await import('youtubei.js')).ClientType.MWEB);
+  return ytMwebPromise;
 }
 
 try {
@@ -142,11 +142,20 @@ app.get('/api/artist/:id', async (req, res, next) => {
 app.get('/api/song/:id', async (req, res, next) => {
   try {
     const yt = await getYT();
-    const [info, format] = await Promise.all([
-      yt.music.getInfo(req.params.id),
-      yt.getStreamingData(req.params.id).catch(() => null),
-    ]);
-    res.json({ ...info, stream_url: format?.url || null });
+    const info = await yt.music.getInfo(req.params.id);
+    let stream_url = null;
+    for (const get of streamClients) {
+      try {
+        const c = await get();
+        const bi = await c.getBasicInfo(req.params.id);
+        const sd = bi?.streaming_data;
+        if (sd?.formats?.length) {
+          stream_url = await sd.formats.at(-1).decipher(c.session.player);
+          break;
+        }
+      } catch (_) {}
+    }
+    res.json({ ...info, stream_url });
   } catch (err) { next(err); }
 });
 
@@ -196,14 +205,23 @@ app.get('/api/related/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+const streamClients = [getYT, getYTMweb, getYTWeb];
+
 app.get('/api/stream/:id', async (req, res, next) => {
   try {
-    const yt = await getYT();
-    const format = await yt.getStreamingData(req.params.id);
-    if (!format?.url) {
-      return res.status(404).json({ error: 'No playable stream found for this video' });
+    for (const get of streamClients) {
+      try {
+        const yt = await get();
+        const info = await yt.getBasicInfo(req.params.id);
+        const sd = info?.streaming_data;
+        if (sd?.formats?.length) {
+          const url = await sd.formats.at(-1).decipher(yt.session.player);
+          const test = await fetch(url, { method: 'HEAD' });
+          if (test.ok) return res.json({ url });
+        }
+      } catch (_) {}
     }
-    res.json({ url: format.url });
+    res.status(404).json({ error: 'No playable stream found for this video' });
   } catch (err) { next(err); }
 });
 
