@@ -207,18 +207,33 @@ app.get('/api/related/:id', async (req, res, next) => {
 
 const streamClients = [getYT, getYTMweb, getYTWeb];
 
+async function getStreamURL(yt, id) {
+  const info = await yt.getBasicInfo(id);
+  const sd = info?.streaming_data;
+  if (sd?.formats?.length) {
+    const url = await sd.formats.at(-1).decipher(yt.session.player);
+    const test = await fetch(url, { method: 'HEAD' });
+    if (test.ok) return url;
+  }
+  const raw = await yt.actions.execute('/player', {
+    videoId: id, racyCheckOk: true, contentCheckOk: true, parse: false,
+  });
+  const rawSd = raw?.data?.streamingData;
+  if (!rawSd?.formats?.length) return null;
+  const f = rawSd.formats.at(-1);
+  const url = await yt.session.player.decipher(f.url, f.signatureCipher || f.cipher);
+  const test = await fetch(url, { method: 'HEAD' });
+  if (test.ok) return url;
+  return null;
+}
+
 app.get('/api/stream/:id', async (req, res, next) => {
   try {
     for (const get of streamClients) {
       try {
         const yt = await get();
-        const info = await yt.getBasicInfo(req.params.id);
-        const sd = info?.streaming_data;
-        if (sd?.formats?.length) {
-          const url = await sd.formats.at(-1).decipher(yt.session.player);
-          const test = await fetch(url, { method: 'HEAD' });
-          if (test.ok) return res.json({ url });
-        }
+        const url = await getStreamURL(yt, req.params.id);
+        if (url) return res.json({ url });
       } catch (_) {}
     }
     res.status(404).json({ error: 'No playable stream found for this video' });
