@@ -137,33 +137,18 @@ async function resolveYTdlp(id) {
 }
 
 // ─── Cloudflare Worker proxy ─────────────────────────────────────────────────
-// The worker relays Innertube API calls from Cloudflare IPs (unblocked by YouTube).
-// Vercel generates the session context locally and sends it + videoId to the worker.
+// The worker fetches YouTube from Cloudflare's IP (unblocked by YouTube).
+// Vercel sends just { videoId }, worker does the heavy lifting.
 
 const PROXY_URL = process.env.YT_PROXY_URL;
-let proxyContext = null;
-
-async function getProxyContext() {
-  if (!proxyContext) {
-    const mod = await import('youtubei.js');
-    const yt = await mod.Innertube.create({
-      cache: new mod.UniversalCache(false),
-      generate_session_locally: true,
-      client_type: mod.ClientType.ANDROID_VR,
-    });
-    proxyContext = yt.session.context;
-  }
-  return proxyContext;
-}
 
 async function resolveViaProxy(id) {
   if (!PROXY_URL) return null;
   try {
-    const context = await getProxyContext();
     const res = await fetch(PROXY_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ videoId: id, context }),
+      body: JSON.stringify({ videoId: id }),
       signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) return null;
