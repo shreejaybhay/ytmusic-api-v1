@@ -202,7 +202,18 @@ app.get('/api/stream/:id', async (req, res, next) => {
   try {
     const yt = await getYT();
     const info = await yt.getBasicInfo(req.params.id);
-    const format = info.streaming_data.formats.at(-1);
+    const sd = info?.streaming_data;
+    if (!sd?.formats?.length) {
+      const info2 = await yt.music.getInfo(req.params.id);
+      const sd2 = info2?.streaming_data;
+      if (!sd2?.formats?.length) {
+        return res.status(404).json({ error: 'No playable stream found for this video' });
+      }
+      const format = sd2.formats.at(-1);
+      const url = await format.decipher(yt.session.player);
+      return res.json({ url });
+    }
+    const format = sd.formats.at(-1);
     const url = await format.decipher(yt.session.player);
     res.json({ url });
   } catch (err) { next(err); }
