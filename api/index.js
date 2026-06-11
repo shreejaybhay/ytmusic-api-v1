@@ -21,22 +21,15 @@ async function createYT() {
     client_type: mod.ClientType.TV_EMBEDDED,
   };
 
-  // Cookie auth: bypasses Vercel IP bot-check.
-  // Set YT_COOKIE in Vercel env vars (copy from browser DevTools).
-  if (process.env.YT_COOKIE) {
-    opts.cookie = process.env.YT_COOKIE;
-  }
+  if (process.env.YT_COOKIE) opts.cookie = process.env.YT_COOKIE;
 
   const yt = await mod.Innertube.create(opts);
 
-  // OAuth: more stable long-term auth alternative to cookie.
-  // If YT_OAUTH is set, use stored access/refresh tokens.
   if (process.env.YT_OAUTH && !process.env.YT_COOKIE) {
     try {
       const credentials = JSON.parse(process.env.YT_OAUTH);
       await yt.session.signIn(credentials);
       yt.session.on('update-credentials', ({ credentials: creds }) => {
-        // Log so you can update the env var (Vercel doesn't support runtime writes)
         console.log('[oauth] Credentials refreshed:', JSON.stringify(creds));
       });
     } catch (e) {
@@ -56,7 +49,80 @@ function getYT() {
 try { app.use(require('cors')()); } catch (_) {}
 app.use(express.json());
 
-// ─── Stream resolver ──────────────────────────────────────────────────────────
+// ─── Third-party stream resolvers (bypass Vercel IP block) ───────────────────
+
+const INVIDIOUS_INSTANCES = [
+  'https://invidious.nerdvpn.de',
+  'https://iv.datura.network',
+  'https://invidious.privacyredirect.com',
+  'https://yt.artemislena.eu',
+  'https://invidious.lunar.icu',
+  'https://invidious.fdn.fr',
+  'https://inv.tux.pizza',
+  'https://invidious.einfachzocken.eu',
+];
+
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://api.piped.yt',
+  'https://piped-api.garudalinux.org',
+  'https://pipedapi.adminforge.de',
+  'https://piped.privacydev.net/api',
+  'https://pipedapi.colinslegacy.com',
+];
+
+async function getStreamFromInvidious(videoId) {
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      const res = await fetch(
+        `${instance}/api/v1/videos/${videoId}?fields=adaptiveFormats,formatStreams`,
+        { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; YTMusicAPI/1.0)' }, signal: AbortSignal.timeout(8000) }
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+
+      const audioFormats = (data.adaptiveFormats || [])
+        .filter(f => f.type?.startsWith('audio/'))
+        .sort((a, b) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0));
+      if (audioFormats.length && audioFormats[0].url)
+        return { url: audioFormats[0].url, client: `invidious` };
+
+      const streams = data.formatStreams || [];
+      if (streams.length) {
+        const url = streams.at(-1).url;
+        if (url) return { url, client: `invidious` };
+      }
+    } catch (e) {
+      console.error(`[invidious] ${instance}:`, e?.message?.substring(0, 80));
+    }
+  }
+  return null;
+}
+
+async function getStreamFromPiped(videoId) {
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/streams/${videoId}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; YTMusicAPI/1.0)' },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.error) continue;
+
+      const audioStreams = (data.audioStreams || []).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      if (audioStreams.length && audioStreams[0].url)
+        return { url: audioStreams[0].url, client: `piped` };
+
+      const videoStreams = (data.videoStreams || []).sort((a, b) => (b.quality || 0) - (a.quality || 0));
+      if (videoStreams.length && videoStreams[0].url)
+        return { url: videoStreams[0].url, client: `piped`, type: 'video' };
+    } catch (e) {
+      console.error(`[piped] ${instance}:`, e?.message?.substring(0, 80));
+    }
+  }
+  return null;
+}
 
 async function resolveYTdlp(id) {
   try {
@@ -70,12 +136,14 @@ async function resolveYTdlp(id) {
   return null;
 }
 
+// ─── Main stream resolver ─────────────────────────────────────────────────────
+
 async function resolveStream(id) {
   const yt = await getYT();
   const player = yt.session.player;
 
-  // Client names matching InnerTube API (MUSIC -> WEB_REMIX, etc.)
-  const clients = ['iOS', 'TV_EMBEDDED', 'ANDROID', 'WEB', 'WEB_REMIX', 'ANDROID_MUSIC', 'ANDROID_VR', 'MWEB', 'WEB_EMBEDDED'];
+  // Strategy 1: youtubei.js with ANDROID_VR first (works for restricted content)
+  const clients = ['ANDROID_VR', 'iOS', 'ANDROID', 'WEB', 'WEB_REMIX', 'ANDROID_MUSIC', 'MWEB'];
 
   for (const client of clients) {
     try {
@@ -110,42 +178,24 @@ async function resolveStream(id) {
     }
   }
 
-  // Try getStreamingData (uses chooseFormat internally)
-  try {
-    const { url } = await yt.getStreamingData(id, { client: 'ANDROID', type: 'audio' });
-    if (url) return { url, client: 'ANDROID(getStreamingData)', type: 'audio' };
-  } catch (e) {
-    console.error(`[stream] getStreamingData error:`, e?.message);
-  }
+  return null;
+}
 
-  // Try getInfo with WEB client (full player response)
-  try {
-    const info = await yt.getInfo(id, { client: 'WEB' });
-    const sd = info?.streaming_data;
-    const tryFormat = async (fmt) => {
-      if (typeof fmt.decipher === 'function' && player) {
-        const url = await fmt.decipher(player);
-        if (url) return url;
-      }
-      return fmt.url || null;
-    };
-    if (sd?.formats?.length) {
-      const url = await tryFormat(sd.formats.at(-1));
-      if (url) return { url, client: 'WEB(getInfo)' };
-    }
-    if (sd?.adaptive_formats?.length) {
-      const audioFmts = sd.adaptive_formats
-        .filter(f => f.mime_type?.startsWith('audio/'))
-        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-      for (const fmt of audioFmts) {
-        const url = await tryFormat(fmt);
-        if (url) return { url, client: 'WEB(getInfo)', type: 'audio' };
-      }
-    }
-  } catch (e) {
-    console.error(`[stream] getInfo fallback error:`, e?.message);
-  }
+async function resolveStreamWithFallback(id) {
+  // Tier 1: youtubei.js (fast, works locally and with YT_COOKIE on Vercel)
+  const result = await resolveStream(id);
+  if (result) return result;
 
+  // Tier 2: Invidious + Piped in parallel (works on Vercel, bypasses IP blocks)
+  const [invResult, pipedResult] = await Promise.allSettled([
+    getStreamFromInvidious(id),
+    getStreamFromPiped(id),
+  ]);
+
+  if (invResult.status === 'fulfilled' && invResult.value) return invResult.value;
+  if (pipedResult.status === 'fulfilled' && pipedResult.value) return pipedResult.value;
+
+  // Tier 3: yt-dlp (local only)
   return resolveYTdlp(id);
 }
 
@@ -233,7 +283,7 @@ app.get('/api/song/:id', async (req, res, next) => {
   try {
     const yt = await getYT();
     const info = await yt.music.getInfo(req.params.id);
-    const streamResult = await resolveStream(req.params.id);
+    const streamResult = await resolveStreamWithFallback(req.params.id);
     res.json({ ...info, stream_url: streamResult?.url || null });
   } catch (err) { next(err); }
 });
@@ -267,12 +317,11 @@ app.get('/api/related/:id', async (req, res, next) => {
   catch (err) { next(err); }
 });
 
-async function pipeStream(url, req, res, timeout = 15000) {
+async function pipeStream(url, req, res, timeout = 20000) {
   const headers = {
     Accept: '*/*',
     Origin: 'https://www.youtube.com',
     Referer: 'https://www.youtube.com',
-    'DNT': '?1',
   };
   if (req.headers.range) headers.Range = req.headers.range;
 
@@ -304,34 +353,25 @@ app.get('/api/stream/:id', async (req, res, next) => {
   try {
     const id = req.params.id;
 
-    // Return URL only when ?url_only=true (for curl, ffmpeg, etc.)
     if (req.query.url_only === 'true') {
-      const result = await resolveStream(id);
+      const result = await resolveStreamWithFallback(id);
       if (!result) return res.status(404).json({ error: 'No playable stream found for this video' });
       return res.json({ url: result.url, client: result.client });
     }
 
-    // Try resolveStream (youtubei.js) first
-    const result = await resolveStream(id);
+    // Tier 1: Try youtubei.js URL
+    const result = await resolveStreamWithFallback(id);
     if (result) {
       const p = await pipeStream(result.url, req, res);
       if (p.ok) return;
       console.error(`[stream] pipe failed (${result.client}):`, p.error);
     }
 
-    // Fallback: yt-dlp directly (handles restricted/DRM content)
-    const ytDlpResult = await resolveYTdlp(id);
-    if (ytDlpResult) {
-      const p = await pipeStream(ytDlpResult.url, req, res);
-      if (p.ok) return;
-      console.error(`[stream] yt-dlp pipe failed:`, p.error);
-    }
-
     res.status(404).json({ error: 'No playable stream found for this video' });
   } catch (err) { next(err); }
 });
 
-// OAuth setup endpoint — call this ONCE to get credentials to store in YT_OAUTH
+// OAuth setup endpoint
 app.get('/api/auth/start', async (req, res, next) => {
   try {
     const mod = await import('youtubei.js');
@@ -343,10 +383,8 @@ app.get('/api/auth/start', async (req, res, next) => {
     let pendingData = null;
     yt.session.on('auth-pending', data => { pendingData = data; });
 
-    // Start sign-in (non-blocking — user visits the URL separately)
     yt.session.signIn().catch(() => {});
 
-    // Wait briefly for the pending data
     await new Promise(r => setTimeout(r, 2000));
 
     if (pendingData) {
@@ -374,22 +412,30 @@ app.get('/api/debug/:id', async (req, res, next) => {
         oauth_set: !!process.env.YT_OAUTH,
         signed_in: yt.session?.logged_in ?? false,
       },
-      clients: {}
+      innertube: {},
+      invidious: null,
+      piped: null,
     };
 
-    for (const client of ['iOS', 'TV_EMBEDDED', 'ANDROID', 'WEB', 'WEB_REMIX', 'ANDROID_VR']) {
+    for (const client of ['ANDROID_VR', 'iOS', 'ANDROID', 'WEB']) {
       try {
         const info = await yt.getBasicInfo(id, { client });
-        out.clients[client] = {
+        out.innertube[client] = {
           playability: info?.playability_status?.status,
-          reason: info?.playability_status?.reason,
           formats: info?.streaming_data?.formats?.length || 0,
           adaptive: info?.streaming_data?.adaptive_formats?.length || 0,
         };
       } catch (e) {
-        out.clients[client] = { error: e?.message };
+        out.innertube[client] = { error: e?.message?.substring(0, 100) };
       }
     }
+
+    const [invResult, pipedResult] = await Promise.allSettled([
+      getStreamFromInvidious(id),
+      getStreamFromPiped(id),
+    ]);
+    out.invidious = invResult.status === 'fulfilled' && invResult.value ? { ok: true } : { ok: false };
+    out.piped = pipedResult.status === 'fulfilled' && pipedResult.value ? { ok: true } : { ok: false };
 
     res.json(out);
   } catch (err) { next(err); }
