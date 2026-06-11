@@ -136,6 +136,29 @@ async function resolveYTdlp(id) {
   return null;
 }
 
+// ─── Cloudflare Worker proxy ─────────────────────────────────────────────────
+// When set, YT_PROXY_URL proxies Innertube API calls from Cloudflare IPs
+// (unblocked by YouTube) instead of Vercel's blocked AWS IPs.
+
+const PROXY_URL = process.env.YT_PROXY_URL;
+
+async function resolveViaProxy(id) {
+  if (!PROXY_URL) return null;
+  try {
+    const res = await fetch(PROXY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ videoId: id }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    console.error('[proxy] error:', e?.message?.substring(0, 100));
+  }
+  return null;
+}
+
 // ─── Main stream resolver ─────────────────────────────────────────────────────
 
 async function resolveStream(id) {
@@ -143,11 +166,8 @@ async function resolveStream(id) {
   const player = yt.session.player;
   const isSignedIn = yt.session?.logged_in ?? false;
 
-  const clients = isSignedIn
-    ? ['WEB', 'WEB_REMIX', 'MWEB', 'iOS', 'ANDROID_VR', 'ANDROID']
-    : ['ANDROID_VR', 'iOS', 'ANDROID', 'MWEB', 'WEB_REMIX', 'WEB'];
-
-  for (const client of clients) {
+  // Try youtubei.js with signed-in clients first
+  for (const client of isSignedIn ? ['WEB', 'WEB_REMIX', 'MWEB'] : ['ANDROID_VR', 'iOS', 'ANDROID', 'MWEB', 'WEB_REMIX', 'WEB']) {
     try {
       const info = await yt.getBasicInfo(id, { client });
       const sd = info?.streaming_data;
@@ -186,20 +206,25 @@ async function resolveStream(id) {
 }
 
 async function resolveStreamWithFallback(id) {
-  // Tier 1: youtubei.js (fast, works locally and with YT_COOKIE on Vercel)
+  // Tier 1: youtubei.js (Works locally; on Vercel requires YT_COOKIE for Music videos)
   const result = await resolveStream(id);
-  if (result) return result;
+  if (result?.url) return result;
 
-  // Tier 2: Invidious + Piped in parallel (works on Vercel, bypasses IP blocks)
+  // Tier 2: Cloudflare Worker proxy (bypasses Vercel IP block for non-Music videos)
+  const proxyResult = await resolveViaProxy(id);
+  if (proxyResult?.url) {
+    return { url: proxyResult.url, client: `proxy(${proxyResult.client || '?'})`, type: proxyResult.type };
+  }
+
+  // Tier 3: Invidious + Piped in parallel
   const [invResult, pipedResult] = await Promise.allSettled([
     getStreamFromInvidious(id),
     getStreamFromPiped(id),
   ]);
-
   if (invResult.status === 'fulfilled' && invResult.value) return invResult.value;
   if (pipedResult.status === 'fulfilled' && pipedResult.value) return pipedResult.value;
 
-  // Tier 3: yt-dlp (local only)
+  // Tier 4: yt-dlp (local only)
   return resolveYTdlp(id);
 }
 
@@ -437,18 +462,7 @@ app.get('/api/debug/:id', async (req, res, next) => {
       }
     }
 
-    // Raw connectivity test
-    try {
-      const rawRes = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false&alt=json', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ videoId: id, context: { client: { clientName: 'ANDROID_VR', clientVersion: '19.09.37' } } }),
-        signal: AbortSignal.timeout(10000),
-      });
-      out.raw_api = { status: rawRes.status, ok: rawRes.ok };
-    } catch (e) {
-      out.raw_api = { error: e?.message?.substring(0, 100) };
-    }
+    out.proxy = { configured: !!process.env.YT_PROXY_URL, url: process.env.YT_PROXY_URL ? process.env.YT_PROXY_URL.substring(0, 40) + '...' : null };
 
     const [invResult, pipedResult] = await Promise.allSettled([
       getStreamFromInvidious(id),
