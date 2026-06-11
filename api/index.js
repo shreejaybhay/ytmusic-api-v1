@@ -18,7 +18,7 @@ async function createYT() {
   const opts = {
     cache: new mod.UniversalCache(false),
     generate_session_locally: true,
-    client_type: mod.ClientType.TV_EMBEDDED,
+    client_type: mod.ClientType.ANDROID_VR,
   };
 
   if (process.env.YT_COOKIE) opts.cookie = process.env.YT_COOKIE;
@@ -167,7 +167,7 @@ async function resolveStream(id) {
   const isSignedIn = yt.session?.logged_in ?? false;
 
   // Try youtubei.js with signed-in clients first
-  for (const client of isSignedIn ? ['WEB', 'WEB_REMIX', 'MWEB'] : ['ANDROID_VR', 'iOS', 'ANDROID', 'MWEB', 'WEB_REMIX', 'WEB']) {
+  for (const client of isSignedIn ? ['WEB', 'MWEB'] : ['ANDROID_VR', 'iOS', 'ANDROID', 'MWEB', 'WEB']) {
     try {
       const info = await yt.getBasicInfo(id, { client });
       const sd = info?.streaming_data;
