@@ -9,11 +9,13 @@ async function createYT(ct) {
   const mod = await import('youtubei.js');
   Platform = mod.Platform;
   Platform.shim.eval = async (data) => new Function(data.output)();
-  return mod.Innertube.create({
+  const opts = {
     cache: new mod.UniversalCache(false),
     client_type: ct,
     generate_session_locally: true,
-  });
+  };
+  if (process.env.YT_COOKIE) opts.cookie = process.env.YT_COOKIE;
+  return mod.Innertube.create(opts);
 }
 
 async function getYT() {
@@ -206,6 +208,25 @@ app.get('/api/related/:id', async (req, res, next) => {
 });
 
 const streamClients = [getYT, getYTMweb, getYTWeb];
+
+app.get('/api/debug/:id', async (req, res, next) => {
+  try {
+    const yt = await getYT();
+    const info = await yt.getBasicInfo(req.params.id);
+    res.json({
+      has_streaming_data: !!info?.streaming_data,
+      formats: info?.streaming_data?.formats?.length || 0,
+      adaptive: info?.streaming_data?.adaptive_formats?.length || 0,
+      playability: info?.playability_status,
+      basic_info: info?.basic_info ? {
+        title: info.basic_info.title,
+        duration: info.basic_info.duration,
+        is_private: info.basic_info.is_private,
+        is_live: info.basic_info.is_live,
+      } : null,
+    });
+  } catch (err) { next(err); }
+});
 
 async function getStreamURL(yt, id) {
   const info = await yt.getBasicInfo(id);
