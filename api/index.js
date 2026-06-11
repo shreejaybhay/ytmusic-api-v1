@@ -74,7 +74,8 @@ async function resolveStream(id) {
   const yt = await getYT();
   const player = yt.session.player;
 
-  const clients = ['IOS', 'TV_EMBEDDED', 'ANDROID', 'WEB', 'MUSIC', 'ANDROID_MUSIC', 'MWEB', 'WEB_EMBEDDED'];
+  // Client names matching InnerTube API (MUSIC -> WEB_REMIX, etc.)
+  const clients = ['iOS', 'TV_EMBEDDED', 'ANDROID', 'WEB', 'WEB_REMIX', 'ANDROID_MUSIC', 'ANDROID_VR', 'MWEB', 'WEB_EMBEDDED'];
 
   for (const client of clients) {
     try {
@@ -89,13 +90,11 @@ async function resolveStream(id) {
         return fmt.url || null;
       };
 
-      // Try progressive formats first (combined audio+video)
       if (sd?.formats?.length) {
         const url = await tryFormat(sd.formats.at(-1));
         if (url) return { url, client };
       }
 
-      // Try audio-only adaptive formats
       if (sd?.adaptive_formats?.length) {
         const audioFmts = sd.adaptive_formats
           .filter(f => f.mime_type?.startsWith('audio/'))
@@ -111,7 +110,15 @@ async function resolveStream(id) {
     }
   }
 
-  // Fallback: try getInfo (full player response)
+  // Try getStreamingData (uses chooseFormat internally)
+  try {
+    const { url } = await yt.getStreamingData(id, { client: 'ANDROID', type: 'audio' });
+    if (url) return { url, client: 'ANDROID(getStreamingData)', type: 'audio' };
+  } catch (e) {
+    console.error(`[stream] getStreamingData error:`, e?.message);
+  }
+
+  // Try getInfo with WEB client (full player response)
   try {
     const info = await yt.getInfo(id, { client: 'WEB' });
     const sd = info?.streaming_data;
@@ -139,7 +146,6 @@ async function resolveStream(id) {
     console.error(`[stream] getInfo fallback error:`, e?.message);
   }
 
-  // Final fallback: yt-dlp (handles restricted/DRM content)
   return resolveYTdlp(id);
 }
 
@@ -261,28 +267,37 @@ app.get('/api/related/:id', async (req, res, next) => {
   catch (err) { next(err); }
 });
 
-async function pipeStream(url, req, res) {
+async function pipeStream(url, req, res, timeout = 15000) {
   const headers = {
-    Referer: 'https://www.youtube.com',
-    Origin: 'https://www.youtube.com',
     Accept: '*/*',
+    Origin: 'https://www.youtube.com',
+    Referer: 'https://www.youtube.com',
+    'DNT': '?1',
   };
   if (req.headers.range) headers.Range = req.headers.range;
 
-  const ytRes = await fetch(url, { headers, redirect: 'follow' });
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeout);
+  try {
+    const ytRes = await fetch(url, { headers, redirect: 'follow', signal: ac.signal });
+    clearTimeout(t);
 
-  if (!ytRes.ok) return null;
+    if (!ytRes.ok) return { error: ytRes.status };
 
-  const ct = ytRes.headers.get('content-type');
-  const cl = ytRes.headers.get('content-length');
-  const cr = ytRes.headers.get('content-range');
-  if (ct) res.setHeader('Content-Type', ct);
-  if (cl) res.setHeader('Content-Length', cl);
-  if (cr) res.setHeader('Content-Range', cr);
-  if (req.headers.range) res.status(206);
+    const ct = ytRes.headers.get('content-type');
+    const cl = ytRes.headers.get('content-length');
+    const cr = ytRes.headers.get('content-range');
+    if (ct) res.setHeader('Content-Type', ct);
+    if (cl) res.setHeader('Content-Length', cl);
+    if (cr) res.setHeader('Content-Range', cr);
+    if (req.headers.range) res.status(206);
 
-  Readable.fromWeb(ytRes.body).pipe(res);
-  return true;
+    Readable.fromWeb(ytRes.body).pipe(res);
+    return { ok: true };
+  } catch (e) {
+    clearTimeout(t);
+    return { error: e.name === 'AbortError' ? 'timeout' : e.message };
+  }
 }
 
 app.get('/api/stream/:id', async (req, res, next) => {
@@ -298,11 +313,19 @@ app.get('/api/stream/:id', async (req, res, next) => {
 
     // Try resolveStream (youtubei.js) first
     const result = await resolveStream(id);
-    if (result && await pipeStream(result.url, req, res)) return;
+    if (result) {
+      const p = await pipeStream(result.url, req, res);
+      if (p.ok) return;
+      console.error(`[stream] pipe failed (${result.client}):`, p.error);
+    }
 
     // Fallback: yt-dlp directly (handles restricted/DRM content)
     const ytDlpResult = await resolveYTdlp(id);
-    if (ytDlpResult && await pipeStream(ytDlpResult.url, req, res)) return;
+    if (ytDlpResult) {
+      const p = await pipeStream(ytDlpResult.url, req, res);
+      if (p.ok) return;
+      console.error(`[stream] yt-dlp pipe failed:`, p.error);
+    }
 
     res.status(404).json({ error: 'No playable stream found for this video' });
   } catch (err) { next(err); }
@@ -354,7 +377,7 @@ app.get('/api/debug/:id', async (req, res, next) => {
       clients: {}
     };
 
-    for (const client of ['IOS', 'TV_EMBEDDED', 'ANDROID', 'WEB', 'MUSIC']) {
+    for (const client of ['iOS', 'TV_EMBEDDED', 'ANDROID', 'WEB', 'WEB_REMIX', 'ANDROID_VR']) {
       try {
         const info = await yt.getBasicInfo(id, { client });
         out.clients[client] = {
