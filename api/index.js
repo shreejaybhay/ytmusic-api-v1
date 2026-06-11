@@ -137,19 +137,34 @@ async function resolveYTdlp(id) {
 }
 
 // ─── Cloudflare Worker proxy ─────────────────────────────────────────────────
-// When set, YT_PROXY_URL proxies Innertube API calls from Cloudflare IPs
-// (unblocked by YouTube) instead of Vercel's blocked AWS IPs.
+// The worker relays Innertube API calls from Cloudflare IPs (unblocked by YouTube).
+// Vercel generates the session context locally and sends it + videoId to the worker.
 
 const PROXY_URL = process.env.YT_PROXY_URL;
+let proxyContext = null;
+
+async function getProxyContext() {
+  if (!proxyContext) {
+    const mod = await import('youtubei.js');
+    const yt = await mod.Innertube.create({
+      cache: new mod.UniversalCache(false),
+      generate_session_locally: true,
+      client_type: mod.ClientType.ANDROID_VR,
+    });
+    proxyContext = yt.session.context;
+  }
+  return proxyContext;
+}
 
 async function resolveViaProxy(id) {
   if (!PROXY_URL) return null;
   try {
+    const context = await getProxyContext();
     const res = await fetch(PROXY_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ videoId: id }),
-      signal: AbortSignal.timeout(20000),
+      body: JSON.stringify({ videoId: id, context }),
+      signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) return null;
     return await res.json();
@@ -462,7 +477,13 @@ app.get('/api/debug/:id', async (req, res, next) => {
       }
     }
 
-    out.proxy = { configured: !!process.env.YT_PROXY_URL, url: process.env.YT_PROXY_URL ? process.env.YT_PROXY_URL.substring(0, 40) + '...' : null };
+    const proxyResult = PROXY_URL ? await resolveViaProxy(id) : null;
+    out.proxy = {
+      configured: !!PROXY_URL,
+      url: PROXY_URL ? PROXY_URL.substring(0, 40) + '...' : null,
+      ok: !!proxyResult?.url,
+      error: proxyResult?.error || null,
+    };
 
     const [invResult, pipedResult] = await Promise.allSettled([
       getStreamFromInvidious(id),
