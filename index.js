@@ -10,28 +10,32 @@ Platform.shim.eval = async (data) => new Function(data.output)();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-let yt, ytWeb;
+let ytPromise, ytWebPromise;
+
+function getYT() {
+  if (!ytPromise) {
+    ytPromise = Innertube.create({
+      cache: new UniversalCache(false),
+      client_type: ClientType.ANDROID,
+    });
+  }
+  return ytPromise;
+}
+
+function getYTWeb() {
+  if (!ytWebPromise) {
+    ytWebPromise = Innertube.create({
+      cache: new UniversalCache(false),
+      client_type: 'WEB',
+    });
+  }
+  return ytWebPromise;
+}
 
 app.use(helmet());
 app.use(cors());
 app.use(morgan('dev'));
 app.use(express.json());
-
-Innertube.create({
-  cache: new UniversalCache(true),
-  client_type: ClientType.ANDROID,
-}).then(instance => {
-  yt = instance;
-  console.log('YouTube initialized (ANDROID client)');
-});
-
-Innertube.create({
-  cache: new UniversalCache(true),
-  client_type: 'WEB',
-}).then(instance => {
-  ytWeb = instance;
-  console.log('YouTube initialized (WEB client)');
-});
 
 app.get('/', (req, res) => {
   res.json({ message: 'YTMusic API is running' });
@@ -39,6 +43,7 @@ app.get('/', (req, res) => {
 
 app.get('/api/search', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const filters = {};
     if (req.query.type && req.query.type !== 'all') {
       filters.type = req.query.type;
@@ -77,6 +82,7 @@ app.get('/api/search', async (req, res, next) => {
 
 app.get('/api/search/all', async (req, res, next) => {
   try {
+    const ytWeb = await getYTWeb();
     const filters = {};
     if (req.query.type) filters.type = req.query.type;
     if (req.query.upload_date) filters.upload_date = req.query.upload_date;
@@ -110,6 +116,7 @@ app.get('/api/search/all', async (req, res, next) => {
 
 app.get('/api/playlist/:id', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const data = await yt.music.getPlaylist(req.params.id);
     res.json(data);
   } catch (err) { next(err); }
@@ -117,6 +124,7 @@ app.get('/api/playlist/:id', async (req, res, next) => {
 
 app.get('/api/album/:id', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const data = await yt.music.getAlbum(req.params.id);
     res.json(data);
   } catch (err) { next(err); }
@@ -124,6 +132,7 @@ app.get('/api/album/:id', async (req, res, next) => {
 
 app.get('/api/artist/:id', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const data = await yt.music.getArtist(req.params.id);
     res.json(data);
   } catch (err) { next(err); }
@@ -131,6 +140,7 @@ app.get('/api/artist/:id', async (req, res, next) => {
 
 app.get('/api/song/:id', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const [info, basic] = await Promise.all([
       yt.music.getInfo(req.params.id),
       yt.getBasicInfo(req.params.id),
@@ -143,6 +153,7 @@ app.get('/api/song/:id', async (req, res, next) => {
 
 app.get('/api/home', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const data = await yt.music.getHomeFeed();
     res.json(data);
   } catch (err) { next(err); }
@@ -150,6 +161,7 @@ app.get('/api/home', async (req, res, next) => {
 
 app.get('/api/explore', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const data = await yt.music.getExplore();
     res.json(data);
   } catch (err) { next(err); }
@@ -157,6 +169,7 @@ app.get('/api/explore', async (req, res, next) => {
 
 app.get('/api/lyrics/:id', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const data = await yt.music.getLyrics(req.params.id);
     res.json(data);
   } catch (err) {
@@ -170,6 +183,7 @@ app.get('/api/lyrics/:id', async (req, res, next) => {
 
 app.get('/api/upnext/:id', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const data = await yt.music.getUpNext(req.params.id);
     res.json(data);
   } catch (err) { next(err); }
@@ -177,6 +191,7 @@ app.get('/api/upnext/:id', async (req, res, next) => {
 
 app.get('/api/related/:id', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const data = await yt.music.getRelated(req.params.id);
     res.json(data);
   } catch (err) { next(err); }
@@ -184,6 +199,7 @@ app.get('/api/related/:id', async (req, res, next) => {
 
 app.get('/api/stream/:id', async (req, res, next) => {
   try {
+    const yt = await getYT();
     const info = await yt.getBasicInfo(req.params.id);
     const format = info.streaming_data.formats.at(-1);
     const url = await format.decipher(yt.session.player);
@@ -206,8 +222,10 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message || 'Something went wrong!' });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
 
 module.exports = app;
