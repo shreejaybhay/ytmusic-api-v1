@@ -141,9 +141,11 @@ async function resolveYTdlp(id) {
 async function resolveStream(id) {
   const yt = await getYT();
   const player = yt.session.player;
+  const isSignedIn = yt.session?.logged_in ?? false;
 
-  // Strategy 1: youtubei.js with ANDROID_VR first (works for restricted content)
-  const clients = ['ANDROID_VR', 'iOS', 'ANDROID', 'WEB', 'WEB_REMIX', 'ANDROID_MUSIC', 'MWEB'];
+  const clients = isSignedIn
+    ? ['WEB', 'WEB_REMIX', 'MWEB', 'iOS', 'ANDROID_VR', 'ANDROID']
+    : ['ANDROID_VR', 'iOS', 'ANDROID', 'MWEB', 'WEB_REMIX', 'WEB'];
 
   for (const client of clients) {
     try {
@@ -152,8 +154,10 @@ async function resolveStream(id) {
 
       const tryFormat = async (fmt) => {
         if (typeof fmt.decipher === 'function' && player) {
-          const url = await fmt.decipher(player);
-          if (url) return url;
+          try {
+            const url = await fmt.decipher(player);
+            if (url) return url;
+          } catch (_) {}
         }
         return fmt.url || null;
       };
@@ -174,7 +178,7 @@ async function resolveStream(id) {
         }
       }
     } catch (e) {
-      console.error(`[stream] client=${client} error:`, e?.message);
+      console.error(`[stream] client=${client} error:`, e?.message?.substring(0, 200));
     }
   }
 
@@ -431,6 +435,19 @@ app.get('/api/debug/:id', async (req, res, next) => {
       } catch (e) {
         out.innertube[client] = { error: e?.message?.substring(0, 100) };
       }
+    }
+
+    // Raw connectivity test
+    try {
+      const rawRes = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false&alt=json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ videoId: id, context: { client: { clientName: 'ANDROID_VR', clientVersion: '19.09.37' } } }),
+        signal: AbortSignal.timeout(10000),
+      });
+      out.raw_api = { status: rawRes.status, ok: rawRes.ok };
+    } catch (e) {
+      out.raw_api = { error: e?.message?.substring(0, 100) };
     }
 
     const [invResult, pipedResult] = await Promise.allSettled([
