@@ -409,7 +409,10 @@ app.get('/api/debug/:id', async (req, res, next) => {
     const out = {
       auth: {
         cookie_set: !!process.env.YT_COOKIE,
+        cookie_length: process.env.YT_COOKIE ? process.env.YT_COOKIE.length : 0,
+        cookie_preview: process.env.YT_COOKIE ? process.env.YT_COOKIE.substring(0, 20) + '...' : null,
         oauth_set: !!process.env.YT_OAUTH,
+        oauth_length: process.env.YT_OAUTH ? process.env.YT_OAUTH.length : 0,
         signed_in: yt.session?.logged_in ?? false,
       },
       innertube: {},
