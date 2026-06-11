@@ -7,7 +7,7 @@ let ytPromise, ytWebPromise, Platform;
 
 async function getYT() {
   if (!ytPromise) {
-    const mod = require('youtubei.js');
+    const mod = await import('youtubei.js');
     Platform = mod.Platform;
     Platform.shim.eval = async (data) => new Function(data.output)();
     ytPromise = mod.Innertube.create({
@@ -20,7 +20,7 @@ async function getYT() {
 
 async function getYTWeb() {
   if (!ytWebPromise) {
-    const mod = require('youtubei.js');
+    const mod = await import('youtubei.js');
     Platform = mod.Platform;
     Platform.shim.eval = async (data) => new Function(data.output)();
     ytWebPromise = mod.Innertube.create({
