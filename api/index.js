@@ -142,13 +142,11 @@ app.get('/api/artist/:id', async (req, res, next) => {
 app.get('/api/song/:id', async (req, res, next) => {
   try {
     const yt = await getYT();
-    const [info, basic] = await Promise.all([
+    const [info, format] = await Promise.all([
       yt.music.getInfo(req.params.id),
-      yt.getBasicInfo(req.params.id),
+      yt.getStreamingData(req.params.id).catch(() => null),
     ]);
-    const format = basic.streaming_data?.formats?.at(-1);
-    const stream_url = format ? await format.decipher(yt.session.player) : null;
-    res.json({ ...info, stream_url });
+    res.json({ ...info, stream_url: format?.url || null });
   } catch (err) { next(err); }
 });
 
@@ -201,21 +199,11 @@ app.get('/api/related/:id', async (req, res, next) => {
 app.get('/api/stream/:id', async (req, res, next) => {
   try {
     const yt = await getYT();
-    const info = await yt.getBasicInfo(req.params.id);
-    const sd = info?.streaming_data;
-    if (!sd?.formats?.length) {
-      const info2 = await yt.music.getInfo(req.params.id);
-      const sd2 = info2?.streaming_data;
-      if (!sd2?.formats?.length) {
-        return res.status(404).json({ error: 'No playable stream found for this video' });
-      }
-      const format = sd2.formats.at(-1);
-      const url = await format.decipher(yt.session.player);
-      return res.json({ url });
+    const format = await yt.getStreamingData(req.params.id);
+    if (!format?.url) {
+      return res.status(404).json({ error: 'No playable stream found for this video' });
     }
-    const format = sd.formats.at(-1);
-    const url = await format.decipher(yt.session.player);
-    res.json({ url });
+    res.json({ url: format.url });
   } catch (err) { next(err); }
 });
 
