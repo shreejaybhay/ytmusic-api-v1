@@ -1,7 +1,9 @@
 const express = require('express');
+const { Readable } = require('stream');
+const { execSync } = require('child_process');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 
 // ─── Innertube client (singleton) ─────────────────────────────────────────────
 let ytPromise = null;
@@ -56,22 +58,40 @@ app.use(express.json());
 
 // ─── Stream resolver ──────────────────────────────────────────────────────────
 
+async function resolveYTdlp(id) {
+  try {
+    const url = `https://music.youtube.com/watch?v=${id}`;
+    const cmd = `python -m yt_dlp -g -f "bestaudio" --no-warnings --no-playlist "${url}"`;
+    const streamUrl = execSync(cmd, { timeout: 30000, encoding: 'utf8' }).trim();
+    if (streamUrl) return { url: streamUrl, client: 'yt-dlp', type: 'audio' };
+  } catch (e) {
+    console.error(`[stream] yt-dlp error:`, e?.message?.substring(0, 200));
+  }
+  return null;
+}
+
 async function resolveStream(id) {
   const yt = await getYT();
+  const player = yt.session.player;
 
-  // Try multiple client types in order
-  const clients = ['IOS', 'TV_EMBEDDED', 'ANDROID', 'WEB'];
+  const clients = ['IOS', 'TV_EMBEDDED', 'ANDROID', 'WEB', 'MUSIC', 'ANDROID_MUSIC', 'MWEB', 'WEB_EMBEDDED'];
 
   for (const client of clients) {
     try {
-      const info = await yt.getBasicInfo(id, client);
+      const info = await yt.getBasicInfo(id, { client });
       const sd = info?.streaming_data;
 
-      // Try progressive formats first (combined audio+video, simpler URL)
+      const tryFormat = async (fmt) => {
+        if (typeof fmt.decipher === 'function' && player) {
+          const url = await fmt.decipher(player);
+          if (url) return url;
+        }
+        return fmt.url || null;
+      };
+
+      // Try progressive formats first (combined audio+video)
       if (sd?.formats?.length) {
-        const fmt = sd.formats.at(-1);
-        const url = fmt.url ?? (typeof fmt.decipher === 'function'
-          ? await fmt.decipher(yt.session.player) : null);
+        const url = await tryFormat(sd.formats.at(-1));
         if (url) return { url, client };
       }
 
@@ -82,8 +102,7 @@ async function resolveStream(id) {
           .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
         for (const fmt of audioFmts) {
-          const url = fmt.url ?? (typeof fmt.decipher === 'function'
-            ? await fmt.decipher(yt.session.player) : null);
+          const url = await tryFormat(fmt);
           if (url) return { url, client, type: 'audio' };
         }
       }
@@ -92,7 +111,36 @@ async function resolveStream(id) {
     }
   }
 
-  return null;
+  // Fallback: try getInfo (full player response)
+  try {
+    const info = await yt.getInfo(id, { client: 'WEB' });
+    const sd = info?.streaming_data;
+    const tryFormat = async (fmt) => {
+      if (typeof fmt.decipher === 'function' && player) {
+        const url = await fmt.decipher(player);
+        if (url) return url;
+      }
+      return fmt.url || null;
+    };
+    if (sd?.formats?.length) {
+      const url = await tryFormat(sd.formats.at(-1));
+      if (url) return { url, client: 'WEB(getInfo)' };
+    }
+    if (sd?.adaptive_formats?.length) {
+      const audioFmts = sd.adaptive_formats
+        .filter(f => f.mime_type?.startsWith('audio/'))
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      for (const fmt of audioFmts) {
+        const url = await tryFormat(fmt);
+        if (url) return { url, client: 'WEB(getInfo)', type: 'audio' };
+      }
+    }
+  } catch (e) {
+    console.error(`[stream] getInfo fallback error:`, e?.message);
+  }
+
+  // Final fallback: yt-dlp (handles restricted/DRM content)
+  return resolveYTdlp(id);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -213,10 +261,49 @@ app.get('/api/related/:id', async (req, res, next) => {
   catch (err) { next(err); }
 });
 
+async function pipeStream(url, req, res) {
+  const headers = {
+    Referer: 'https://www.youtube.com',
+    Origin: 'https://www.youtube.com',
+    Accept: '*/*',
+  };
+  if (req.headers.range) headers.Range = req.headers.range;
+
+  const ytRes = await fetch(url, { headers, redirect: 'follow' });
+
+  if (!ytRes.ok) return null;
+
+  const ct = ytRes.headers.get('content-type');
+  const cl = ytRes.headers.get('content-length');
+  const cr = ytRes.headers.get('content-range');
+  if (ct) res.setHeader('Content-Type', ct);
+  if (cl) res.setHeader('Content-Length', cl);
+  if (cr) res.setHeader('Content-Range', cr);
+  if (req.headers.range) res.status(206);
+
+  Readable.fromWeb(ytRes.body).pipe(res);
+  return true;
+}
+
 app.get('/api/stream/:id', async (req, res, next) => {
   try {
-    const result = await resolveStream(req.params.id);
-    if (result) return res.json({ url: result.url, client: result.client });
+    const id = req.params.id;
+
+    // Return URL only when ?url_only=true (for curl, ffmpeg, etc.)
+    if (req.query.url_only === 'true') {
+      const result = await resolveStream(id);
+      if (!result) return res.status(404).json({ error: 'No playable stream found for this video' });
+      return res.json({ url: result.url, client: result.client });
+    }
+
+    // Try resolveStream (youtubei.js) first
+    const result = await resolveStream(id);
+    if (result && await pipeStream(result.url, req, res)) return;
+
+    // Fallback: yt-dlp directly (handles restricted/DRM content)
+    const ytDlpResult = await resolveYTdlp(id);
+    if (ytDlpResult && await pipeStream(ytDlpResult.url, req, res)) return;
+
     res.status(404).json({ error: 'No playable stream found for this video' });
   } catch (err) { next(err); }
 });
@@ -267,9 +354,9 @@ app.get('/api/debug/:id', async (req, res, next) => {
       clients: {}
     };
 
-    for (const client of ['IOS', 'TV_EMBEDDED', 'ANDROID']) {
+    for (const client of ['IOS', 'TV_EMBEDDED', 'ANDROID', 'WEB', 'MUSIC']) {
       try {
-        const info = await yt.getBasicInfo(id, client);
+        const info = await yt.getBasicInfo(id, { client });
         out.clients[client] = {
           playability: info?.playability_status?.status,
           reason: info?.playability_status?.reason,
